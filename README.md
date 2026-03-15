@@ -95,13 +95,13 @@ You need testnet USDC on Monad to send messages. Do this before running the app:
 ### 1. Install dependencies
 
 ```bash
-npm install
+cd app && npm install
 ```
 
 ### 2. Configure environment variables
 
 ```bash
-cp .env.local.example .env.local
+cd app && cp .env.local.example .env.local
 ```
 
 Fill in `.env.local`:
@@ -122,7 +122,7 @@ This allows email users to get an auto-generated smart account.
 ### 4. Run the dev server
 
 ```bash
-npm run dev
+cd app && npm run dev
 ```
 
 Open [http://localhost:3000](http://localhost:3000).
@@ -156,19 +156,39 @@ Open [http://localhost:3000](http://localhost:3000).
 
 ---
 
-## Project Structure
+## Repository Structure
+
+This is a monorepo. Each subfolder is an independent project with its own `package.json`.
 
 ```
-app/
-  api/chat/route.ts   # x402-gated POST endpoint
-  layout.tsx          # Root layout, wraps app in PrivyProvider
-  page.tsx            # Main page (Header + Chatbox)
-  globals.css         # Tailwind base styles
-components/
-  PrivyProviderWrapper.tsx  # Client-side Privy provider
-  Header.tsx                # Nav bar with wallet connect
-  Chatbox.tsx               # Chat UI — two-step pay flow (quote → confirm → settle)
+monadclaw-guild/
+├── app/                        # Next.js 14 dapp (the chat UI)
+│   ├── app/
+│   │   ├── api/chat/route.ts   # x402-gated POST endpoint + OpenClaw agent call
+│   │   ├── layout.tsx          # Root layout, wraps app in PrivyProvider
+│   │   └── page.tsx            # Main page (Header + Chatbox)
+│   └── components/
+│       ├── PrivyProviderWrapper.tsx  # Client-side Privy provider
+│       ├── Header.tsx                # Nav bar with wallet connect
+│       └── Chatbox.tsx               # Chat UI — two-step pay flow
+│
+├── services/                   # Standalone Node.js x402 services (VPS)
+│   ├── monad-price-api.js      # GET /monad-price — x402-gated Monad price feed
+│   └── monadclaw-pay.js        # CLI client to pay any x402 URL from a private key
+│
+└── skills/                     # AgentSkills-compatible OpenClaw skills
+    └── monad-price/
+        ├── SKILL.md            # Skill metadata and instructions
+        └── scripts/
+            └── get-monad-price.js  # Pays the price API and returns MON/USD
 ```
+
+### Running each part
+
+| Part | Command | Port |
+|---|---|---|
+| Next.js dapp | `cd app && npm run dev` | 3000 |
+| Price API service | `cd services && node monad-price-api.js` | 4001 |
 
 ---
 

@@ -6,7 +6,7 @@ const path = require('path');
 
 // Resolve monadclaw-services from this script's location:
 // skills/monad-price/scripts/ -> ../../../monadclaw-services/
-const servicesDir = path.resolve(__dirname, '../../../monadclaw-services');
+const servicesDir = path.resolve(__dirname, '../../../services');
 
 require(path.join(servicesDir, 'node_modules/dotenv')).config({
   path: path.join(servicesDir, '.env'),
