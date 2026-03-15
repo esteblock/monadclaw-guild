@@ -4,7 +4,7 @@ description: Phase 1 is a Next.js 14 app with Privy wallet auth and a local-stat
 type: project
 ---
 
-Phase 1 scaffold is complete and builds successfully.
+Phase 1 + Phase 2 complete and building successfully.
 
 **Why:** Hackathon POC — no backend yet, messages are in local React state.
 
