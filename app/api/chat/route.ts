@@ -39,7 +39,7 @@ function computeResponse(message: string) {
 export async function POST(req: NextRequest) {
   console.log('\n[x402] ─── Incoming POST /api/chat ───');
 
-  const { message } = await req.json();
+  const { message, walletAddress } = await req.json();
   const { responseText, charCount, priceUSDC, priceUnits } = computeResponse(message);
 
   console.log(`[x402] response="${responseText}" | chars=${charCount} | price=$${priceUSDC} USDC (${priceUnits} units)`);
@@ -120,8 +120,56 @@ export async function POST(req: NextRequest) {
 
   console.log(`[x402] ✅ Settled — tx=${settle.transaction} | chars=${charCount} | $${priceUSDC} USDC`);
 
+  // ── Call OpenClaw agent (falls back to hardcoded reply if not configured) ──
+  let replyText: string;
+  const ocUrl = process.env.OPENCLAW_GATEWAY_URL;
+
+  if (ocUrl) {
+    const sessionKey = 'agent:main:main';
+    console.log(`[openclaw] calling sessions_send | session=${sessionKey}`);
+    try {
+      const ocRes = await fetch(`${ocUrl}/tools/invoke`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${process.env.OPENCLAW_GATEWAY_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          tool: 'sessions_send',
+          args: { sessionKey, message, timeoutSeconds: 60 },
+        }),
+        signal: AbortSignal.timeout(65_000),
+      });
+
+      if (!ocRes.ok) {
+        const errBody = await ocRes.text();
+        console.error(`[openclaw] gateway error ${ocRes.status}:`, errBody);
+        replyText = 'Agent não respondeu. Tente novamente.';
+      } else {
+        const ocJson = await ocRes.json();
+        const details = ocJson?.result?.details;
+        const agentReply = details?.reply ?? ocJson?.result?.reply;
+        if (agentReply) {
+          console.log('[openclaw] reply:', agentReply);
+          replyText = agentReply;
+        } else if (details?.status === 'timeout') {
+          console.error('[openclaw] session timeout — session:', details?.sessionKey);
+          replyText = 'Agent demorou demais para responder. Tente novamente.';
+        } else {
+          console.error('[openclaw] no reply — full response:', JSON.stringify(ocJson));
+          replyText = 'Agent não respondeu. Tente novamente.';
+        }
+      }
+    } catch (err) {
+      console.error('[openclaw] fetch failed:', err);
+      replyText = 'Agent não respondeu. Tente novamente.';
+    }
+  } else {
+    replyText = responseText; // fallback: "Message received: [text]"
+  }
+
   return NextResponse.json(
-    { reply: responseText, charCount, priceUSDC },
+    { reply: replyText, charCount, priceUSDC },
     { headers: settle.headers },
   );
 }

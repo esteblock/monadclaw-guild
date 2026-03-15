@@ -53,6 +53,31 @@ Character count is taken from the **user's message** (not the response wrapper),
 
 ---
 
+## Phase 5: Real OpenClaw Agent
+
+After payment settles, the server forwards the user's message to a real OpenClaw agent
+and returns its reply. Each connected wallet gets its own persistent session with memory,
+so users can refer to previous messages across browser sessions.
+
+**How it works:**
+
+1. Payment is verified and settled (same as Phase 4)
+2. The server calls `POST /tools/invoke` on the OpenClaw Gateway with `sessions_send`
+3. The session key is `agent:main:monadclaw:0xYourWalletAddress` — unique per wallet
+4. OpenClaw runs the agent turn synchronously and returns the reply inline (no polling)
+5. The server returns the reply with the settled tx hash
+
+**Agent model:** `openrouter/google/gemini-2.5-flash` via OpenRouter
+
+**Fallback:** If `OPENCLAW_GATEWAY_URL` is not set, the server falls back to
+`"Message received: [text]"` so the app stays deployable without a VPS.
+
+**Session ID:** Shown in small muted text at the top of the chat (`Sessão: monadclaw:0x…`).
+
+See [Connecting Your OpenClaw Agent](#connecting-your-openclaw-agent) for VPS setup.
+
+---
+
 ## Getting Testnet USDC
 
 You need testnet USDC on Monad to send messages. Do this before running the app:
@@ -86,7 +111,7 @@ NEXT_PUBLIC_PRIVY_APP_ID=your-privy-app-id
 WALLET_ADDRESS=your-recipient-wallet-address
 ```
 
-- **`NEXT_PUBLIC_PRIVY_APP_ID`** — from your app at [privy.io](https://privy.io) (Settings → App ID)
+- **`NEXT_PUBLIC_PRIVY_APP_ID`** — from your app at [dashboard.privy.io/apps](https://dashboard.privy.io/apps) → Settings → App ID
 - **`WALLET_ADDRESS`** — the wallet that receives USDC payments (can be your own wallet address)
 
 ### 3. Enable Embedded Wallets in Privy
@@ -123,6 +148,12 @@ Open [http://localhost:3000](http://localhost:3000).
 - Bubble states: `Getting price…` → `Need to pay $X USDC (N chars)` → `Paying $X USDC…` → `Paid $X USDC (N chars) ✓`
 - Bot reply appended separately with tx hash hyperlink to `testnet.monadvision.com`
 
+### Phase 5
+- Real OpenClaw agent replaces hardcoded stub — replies via `sessions_send` (synchronous, no polling)
+- Per-wallet persistent sessions: `agent:main:monadclaw:0xYourAddress` — agent remembers previous messages
+- Session ID displayed at top of chat (`Sessão: monadclaw:0x…`)
+- Graceful fallback to `"Message received: [text]"` when `OPENCLAW_GATEWAY_URL` is unset
+
 ---
 
 ## Project Structure
@@ -138,6 +169,227 @@ components/
   Header.tsx                # Nav bar with wallet connect
   Chatbox.tsx               # Chat UI — two-step pay flow (quote → confirm → settle)
 ```
+
+---
+
+## Connecting Your OpenClaw Agent
+
+MonadClaw Guild uses an OpenClaw instance as the AI agent backend. Any OpenClaw
+instance running on a VPS can be connected. Follow these steps:
+
+### Prerequisites
+- OpenClaw already installed and configured on a VPS with a public IP
+- Your `~/.openclaw/openclaw.json` exists and has a working agent
+- Port 18789 open on your VPS firewall
+
+### Step 1 — Update your openclaw.json
+
+Add or merge these sections into your existing `~/.openclaw/openclaw.json`.
+Do not replace the whole file — only add the missing keys:
+
+```json
+{
+  "hooks": {
+    "enabled": true,
+    "token": "YOUR_HOOKS_SECRET",
+    "path": "/hooks",
+    "allowRequestSessionKey": true,
+    "allowedSessionKeyPrefixes": ["monadclaw:"]
+  },
+  "gateway": {
+    "port": 18789,
+    "bind": "0.0.0.0",
+    "auth": {
+      "mode": "token",
+      "token": "YOUR_GATEWAY_SECRET"
+    },
+    "tools": {
+      "allow": ["sessions_send"]
+    }
+  }
+}
+```
+
+Two important changes from a default OpenClaw config:
+- `bind: "0.0.0.0"` — allows external connections (default is `"loopback"` which
+  blocks everything outside the VPS)
+- `tools.allow: ["sessions_send"]` — enables the synchronous request→reply path
+  that MonadClaw uses to get responses without polling
+
+Generate strong secrets with:
+```bash
+openssl rand -hex 16
+```
+
+### Step 2 — Open the firewall port
+
+```bash
+ufw allow 18789/tcp
+ufw status
+```
+
+For production, restrict to only your Next.js server IP:
+```bash
+ufw allow from YOUR_NEXTJS_SERVER_IP to any port 18789
+```
+
+### Step 3 — Restart OpenClaw Gateway
+
+```bash
+pkill -f "openclaw" || true
+sleep 2
+nohup npx openclaw > ~/.openclaw/gateway.log 2>&1 &
+sleep 5
+ss -tlnp | grep 18789
+```
+
+### Step 4 — Test the connection
+
+From your VPS, confirm sessions_send works synchronously:
+
+```bash
+curl -s -X POST http://localhost:18789/tools/invoke \
+  -H 'Authorization: Bearer YOUR_GATEWAY_SECRET' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "tool": "sessions_send",
+    "args": {
+      "sessionKey": "monadclaw:test",
+      "message": "Reply with the word READY",
+      "timeoutSeconds": 30
+    }
+  }'
+```
+
+Expected response:
+```json
+{ "result": { "status": "ok", "reply": "READY" } }
+```
+
+### Step 5 — Add env vars to MonadClaw Guild
+
+Find your VPS public IP:
+```bash
+curl -s ifconfig.me
+```
+
+Add to your `.env.local`:
+```bash
+OPENCLAW_GATEWAY_URL=http://YOUR_VPS_PUBLIC_IP:18789
+OPENCLAW_GATEWAY_TOKEN=YOUR_GATEWAY_SECRET
+OPENCLAW_AGENT_ID=main
+```
+
+If you have multiple agents configured (like `main` and `tania`), set
+`OPENCLAW_AGENT_ID` to whichever agent you want MonadClaw to talk to.
+
+### Session isolation
+
+Each connected wallet gets its own OpenClaw session automatically via
+`monadclaw:0xYourWalletAddress`. OpenClaw maintains conversation memory
+per session — users can refer to previous messages across browser sessions.
+
+### Security note
+
+The gateway token is your only authentication layer. Never commit it to git.
+For production, put OpenClaw behind a reverse proxy (nginx/Caddy) with TLS
+so traffic to port 18789 is encrypted.
+
+---
+
+## OpenClaw Webhook API
+
+The OpenClaw gateway exposes HTTP webhook endpoints for triggering agent turns from external systems.
+
+### Configuration
+
+Add to `~/.openclaw/openclaw.json`:
+
+```json
+{
+  "hooks": {
+    "enabled": true,
+    "token": "YOUR_HOOKS_SECRET",
+    "path": "/hooks",
+    "allowedAgentIds": ["hooks", "main"]
+  }
+}
+```
+
+### Authentication
+
+All requests require the hook token:
+- `Authorization: Bearer <token>` (recommended)
+- `x-openclaw-token: <token>`
+
+Query string tokens are rejected with a 400.
+
+### Endpoints
+
+#### `POST /hooks/wake`
+
+Enqueues a system event for the main session.
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `text` | ✓ | String describing the event |
+| `mode` | — | `now` \| `next-heartbeat` (default: `now`) |
+
+#### `POST /hooks/agent`
+
+Runs an isolated agent turn and posts results to the main session.
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `message` | ✓ | Prompt for processing |
+| `name` | — | Human-readable hook identifier |
+| `agentId` | — | Route to a specific agent |
+| `sessionKey` | — | Session identifier (disabled by default) |
+| `wakeMode` | — | Trigger timing |
+| `deliver` | — | Send response to a messaging channel |
+| `channel` | — | Messaging platform (slack, discord, telegram, …) |
+| `to` | — | Recipient identifier |
+| `model` | — | Model override |
+| `thinking` | — | Thinking level override |
+| `timeoutSeconds` | — | Maximum run duration |
+
+#### `POST /hooks/<name>`
+
+Maps arbitrary external payloads to wake or agent actions via configured mappings.
+
+### Session key security
+
+Request `sessionKey` overrides are disabled by default. Recommended config:
+
+```json
+{
+  "hooks": {
+    "enabled": true,
+    "token": "YOUR_HOOKS_SECRET",
+    "defaultSessionKey": "hook:ingress",
+    "allowRequestSessionKey": false,
+    "allowedSessionKeyPrefixes": ["hook:"]
+  }
+}
+```
+
+### HTTP response codes
+
+| Code | Meaning |
+|------|---------|
+| 200 | Successful execution |
+| 400 | Invalid payload |
+| 401 | Authentication failure |
+| 413 | Oversized payload |
+| 429 | Rate-limited after repeated failures |
+
+### Security recommendations
+
+- Restrict webhooks behind loopback or trusted proxy
+- Use a dedicated hook token (separate from gateway token)
+- Set `hooks.allowedAgentIds` to control multi-agent routing
+- Keep `allowRequestSessionKey: false` unless necessary
+- Restrict `allowedSessionKeyPrefixes` if enabling request overrides
 
 ---
 

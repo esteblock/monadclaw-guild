@@ -184,7 +184,7 @@ export default function Chatbox() {
           'Access-Control-Expose-Headers': 'PAYMENT-RESPONSE,X-PAYMENT-RESPONSE',
           ...paymentHeaders,
         },
-        body: JSON.stringify({ message }),
+        body: JSON.stringify({ message, walletAddress: wallet.address }),
       });
 
       console.log('[chat] retry status:', res2.status, res2.statusText);
@@ -277,8 +277,17 @@ export default function Chatbox() {
 
   const isBlocked = isSending || !!pendingPayment;
 
+  const sessionAddress = wallets[0]?.address;
+
   return (
     <div className="flex flex-col h-full">
+      {/* Session ID */}
+      {sessionAddress && (
+        <div className="px-4 pt-2 pb-0 text-xs text-gray-600 select-none">
+          Sessão: monadclaw:{sessionAddress.slice(0, 6)}…{sessionAddress.slice(-4)}
+        </div>
+      )}
+
       {/* Message history */}
       <div className="flex-1 overflow-y-auto px-4 py-4 space-y-3">
         {messages.map((msg) => (
