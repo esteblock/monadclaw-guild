@@ -2,8 +2,8 @@
 
 import { useState, useRef, useEffect } from 'react';
 import { useWallets } from '@privy-io/react-auth';
-import { wrapFetchWithPayment, decodePaymentResponseHeader } from '@x402/fetch';
-import { x402Client } from '@x402/core/client';
+import { decodePaymentResponseHeader } from '@x402/fetch';
+import { x402Client, x402HTTPClient } from '@x402/core/client';
 import { ExactEvmScheme } from '@x402/evm';
 import { createWalletClient, custom, defineChain } from 'viem';
 
@@ -23,8 +23,18 @@ interface Message {
   link?: { label: string; url: string };
 }
 
-// Price matches route.ts: amount "10" with 6 USDC decimals
-const PRICE_USDC = '0.00001 USDC';
+interface PendingPayment {
+  loadingId: string;
+  priceUSDC: number;
+  charCount: number;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  paymentRequired: Record<string, any>;
+  message: string;
+}
+
+function formatUSDC(amount: number): string {
+  return amount.toFixed(6).replace(/0+$/, '').replace(/\.$/, '');
+}
 
 const INITIAL_MESSAGES: Message[] = [
   {
@@ -38,6 +48,7 @@ export default function Chatbox() {
   const [messages, setMessages] = useState<Message[]>(INITIAL_MESSAGES);
   const [input, setInput] = useState('');
   const [isSending, setIsSending] = useState(false);
+  const [pendingPayment, setPendingPayment] = useState<PendingPayment | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const { wallets } = useWallets();
 
@@ -45,9 +56,10 @@ export default function Chatbox() {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
+  // ── Step 1: fetch price (first request, no payment) ──────────────────────────
   const sendMessage = async () => {
     const text = input.trim();
-    if (!text || isSending) return;
+    if (!text || isSending || !!pendingPayment) return;
 
     setInput('');
     setIsSending(true);
@@ -56,17 +68,76 @@ export default function Chatbox() {
     setMessages((prev) => [
       ...prev,
       { id: `${Date.now()}-user`, text, sender: 'user' },
-      { id: loadingId, text: `Paying ${PRICE_USDC}…`, sender: 'bot' },
+      { id: loadingId, text: 'Getting price…', sender: 'bot' },
     ]);
 
     try {
+      const res1 = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: text }),
+      });
+
+      if (res1.status !== 402) {
+        throw new Error(`Expected 402 pricing response, got ${res1.status}`);
+      }
+
+      const body402 = await res1.json().catch(() => ({})) as { charCount?: number; priceUSDC?: number };
+      const charCount = body402.charCount ?? 0;
+      const priceUSDC = body402.priceUSDC ?? 0;
+
+      const paymentRequiredRaw = res1.headers.get('payment-required') ?? res1.headers.get('PAYMENT-REQUIRED');
+      if (!paymentRequiredRaw) throw new Error('Server did not return payment requirements');
+
+      const paymentRequired = JSON.parse(atob(paymentRequiredRaw));
+
+      console.log('[chat] 402 received — chars:', charCount, '| price: $', priceUSDC, 'USDC');
+
+      // Show price with inline Pay button
+      setMessages((prev) =>
+        prev.map((msg) =>
+          msg.id === loadingId
+            ? { ...msg, text: `Need to pay $${formatUSDC(priceUSDC)} USDC (${charCount} chars)` }
+            : msg,
+        ),
+      );
+
+      setPendingPayment({ loadingId, priceUSDC, charCount, paymentRequired, message: text });
+    } catch (err) {
+      console.error('[chat] price fetch error:', err);
+      const errMsg = err instanceof Error ? err.message : 'Something went wrong';
+      setMessages((prev) =>
+        prev.map((msg) =>
+          msg.id === loadingId ? { ...msg, text: `Error: ${errMsg}` } : msg,
+        ),
+      );
+    } finally {
+      setIsSending(false);
+    }
+  };
+
+  // ── Step 2: user confirms → sign and submit payment ──────────────────────────
+  const executePay = async () => {
+    if (!pendingPayment) return;
+    const { loadingId, priceUSDC, charCount, paymentRequired, message } = pendingPayment;
+
+    setPendingPayment(null);
+    setIsSending(true);
+
+    setMessages((prev) =>
+      prev.map((msg) =>
+        msg.id === loadingId
+          ? { ...msg, text: `Paying $${formatUSDC(priceUSDC)} USDC…` }
+          : msg,
+      ),
+    );
+
+    try {
       const wallet = wallets[0];
-      console.log('[chat] wallets available:', wallets.length, '| using:', wallet?.address ?? 'none');
+      console.log('[chat] executing pay — wallet:', wallet?.address ?? 'none');
       if (!wallet) throw new Error('No wallet connected. Please connect first.');
 
       const provider = await wallet.getEthereumProvider();
-      console.log('[chat] got EthereumProvider from Privy wallet');
-
       const walletClient = createWalletClient({
         account: wallet.address as `0x${string}`,
         chain: monadTestnet,
@@ -81,7 +152,7 @@ export default function Chatbox() {
           primaryType: string;
           message: Record<string, unknown>;
         }) => {
-          console.log('[chat] signTypedData called — primaryType:', msg.primaryType, '| domain:', JSON.stringify(msg.domain));
+          console.log('[chat] signTypedData — primaryType:', msg.primaryType, '| domain:', JSON.stringify(msg.domain));
           return walletClient.signTypedData({
             account: wallet.address as `0x${string}`,
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -95,41 +166,44 @@ export default function Chatbox() {
         },
       };
 
-      const exactScheme = new ExactEvmScheme(evmSigner);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const exactScheme = new ExactEvmScheme(evmSigner as any);
       const client = new x402Client().register('eip155:10143', exactScheme);
-      console.log('[chat] x402 client ready — registered for eip155:10143, calling fetchWithPayment …');
+      const httpClient = new x402HTTPClient(client);
 
-      const fetchWithPayment = wrapFetchWithPayment(fetch, client);
+      console.log('[chat] creating payment payload …');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const paymentPayload = await client.createPaymentPayload(paymentRequired as any);
+      const paymentHeaders = httpClient.encodePaymentSignatureHeader(paymentPayload);
 
-      const res = await fetchWithPayment('/api/chat', {
+      console.log('[chat] retrying with payment …');
+      const res2 = await fetch('/api/chat', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: text }),
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Expose-Headers': 'PAYMENT-RESPONSE,X-PAYMENT-RESPONSE',
+          ...paymentHeaders,
+        },
+        body: JSON.stringify({ message }),
       });
 
-      console.log('[chat] fetchWithPayment response — status:', res.status, res.statusText);
+      console.log('[chat] retry status:', res2.status, res2.statusText);
 
-      if (res.status === 402) {
-        const body = await res.json().catch(() => ({})) as { error?: string };
-        console.log('[chat] 402 body:', JSON.stringify(body));
+      if (res2.status === 402) {
+        const body = await res2.json().catch(() => ({})) as { error?: string };
         const reason = body.error ?? 'Payment verification failed';
         const isNoFunds =
           reason.toLowerCase().includes('insufficient') ||
-          reason.toLowerCase().includes('transfer') ||
           reason.toLowerCase().includes('funds');
-
         setMessages((prev) =>
           prev.map((msg) =>
             msg.id === loadingId
               ? {
                   ...msg,
                   text: isNoFunds
-                    ? `Not enough USDC to pay for this message (${reason}). Get free testnet USDC:`
+                    ? `Not enough USDC. Get testnet USDC:`
                     : `Payment failed: ${reason}. If you need testnet USDC:`,
-                  link: {
-                    label: 'Get USDC at faucet.circle.com',
-                    url: 'https://faucet.circle.com/',
-                  },
+                  link: { label: 'Get USDC at faucet.circle.com', url: 'https://faucet.circle.com/' },
                 }
               : msg,
           ),
@@ -137,24 +211,27 @@ export default function Chatbox() {
         return;
       }
 
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({})) as { error?: string };
-        console.error('[chat] non-ok response:', res.status, err);
-        throw new Error(err.error ?? `HTTP ${res.status}`);
+      if (!res2.ok) {
+        const err = await res2.json().catch(() => ({})) as { error?: string };
+        console.error('[chat] non-ok response:', res2.status, err);
+        throw new Error(err.error ?? `HTTP ${res2.status}`);
       }
 
-      const data = (await res.json()) as { reply?: string };
-      console.log('[chat] success — reply:', data.reply);
+      const data = await res2.json() as { reply?: string; charCount?: number; priceUSDC?: number };
+      console.log('[chat] success — reply:', data.reply, '| chars:', data.charCount, '| price:', data.priceUSDC);
 
-      // Decode settlement response to get tx hash
+      const paidPrice = data.priceUSDC ?? priceUSDC;
+      const paidChars = data.charCount ?? charCount;
+
+      // Decode PAYMENT-RESPONSE header for tx hash
       let txHash: string | null = null;
-      const paymentResponseRaw = res.headers.get('payment-response') ?? res.headers.get('PAYMENT-RESPONSE');
+      const paymentResponseRaw = res2.headers.get('payment-response') ?? res2.headers.get('PAYMENT-RESPONSE');
       if (paymentResponseRaw) {
         try {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const paymentResponse = decodePaymentResponseHeader(paymentResponseRaw) as any;
-          txHash = paymentResponse?.transaction ?? null;
-          console.log('[chat] payment response decoded:', JSON.stringify(paymentResponse));
+          const settlement = decodePaymentResponseHeader(paymentResponseRaw) as any;
+          txHash = settlement?.transaction ?? null;
+          console.log('[chat] settlement decoded:', JSON.stringify(settlement));
         } catch (e) {
           console.error('[chat] failed to decode PAYMENT-RESPONSE:', e);
         }
@@ -162,11 +239,13 @@ export default function Chatbox() {
 
       const replyId = `${Date.now()}-reply`;
       setMessages((prev) => [
-        // Update "Paying…" → "Paid ✓ 0.00001 USDC"
+        // "Paying..." → "Paid $X (N chars) ✓"
         ...prev.map((msg) =>
-          msg.id === loadingId ? { ...msg, text: `Paid ${PRICE_USDC} ✓` } : msg,
+          msg.id === loadingId
+            ? { ...msg, text: `Paid $${formatUSDC(paidPrice)} USDC (${paidChars} chars) ✓` }
+            : msg,
         ),
-        // New bubble: bot reply + tx link
+        // Bot reply with tx link
         {
           id: replyId,
           text: data.reply ?? 'Reply received',
@@ -180,7 +259,7 @@ export default function Chatbox() {
         },
       ]);
     } catch (err) {
-      console.error('[chat] caught error:', err);
+      console.error('[chat] pay error:', err);
       const errMsg = err instanceof Error ? err.message : 'Something went wrong';
       setMessages((prev) =>
         prev.map((msg) =>
@@ -195,6 +274,8 @@ export default function Chatbox() {
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Enter') sendMessage();
   };
+
+  const isBlocked = isSending || !!pendingPayment;
 
   return (
     <div className="flex flex-col h-full">
@@ -213,6 +294,17 @@ export default function Chatbox() {
               }`}
             >
               {msg.text}
+
+              {/* Pay button — appears only on the pending payment bubble */}
+              {pendingPayment?.loadingId === msg.id && (
+                <button
+                  onClick={executePay}
+                  className="mt-2 w-full py-1.5 px-3 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-xs font-medium transition-colors"
+                >
+                  Pay now →
+                </button>
+              )}
+
               {msg.link && (
                 <a
                   href={msg.link.url}
@@ -237,13 +329,19 @@ export default function Chatbox() {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder={isSending ? 'Processing payment…' : 'Type a message…'}
-            disabled={isSending}
+            placeholder={
+              isSending
+                ? 'Processing…'
+                : pendingPayment
+                  ? 'Confirm payment above…'
+                  : 'Type a message…'
+            }
+            disabled={isBlocked}
             className="flex-1 bg-gray-800 text-white placeholder-gray-500 rounded-xl px-4 py-2.5 text-sm outline-none focus:ring-2 focus:ring-purple-600 transition-all disabled:opacity-50"
           />
           <button
             onClick={sendMessage}
-            disabled={!input.trim() || isSending}
+            disabled={!input.trim() || isBlocked}
             className="px-4 py-2.5 bg-purple-600 hover:bg-purple-500 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed text-white rounded-xl text-sm font-medium transition-colors"
           >
             {isSending ? '…' : 'Send'}
