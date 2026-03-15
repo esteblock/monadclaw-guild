@@ -28,9 +28,9 @@ const httpServer = new x402HTTPResourceServer(resourceServer, {});
 function computeResponse(message: string) {
   const responseText = `Message received: ${message}`;
   const charCount = message.length; // bill on the user's message, not the wrapper prefix
-  // $0.00001 USDC per character = 10 units/char (USDC has 6 decimals); minimum 1 unit
+  // $0.0001 USDC per character = 100 units/char (USDC has 6 decimals); minimum 1 unit
   // Compute units as integer first, then derive priceUSDC to avoid floating-point noise
-  const priceUnitsNum = Math.max(1, charCount * 10);
+  const priceUnitsNum = Math.max(1, charCount * 100);
   const priceUSDC = priceUnitsNum / 1_000_000;
   const priceUnits = String(priceUnitsNum);
   return { responseText, charCount, priceUSDC, priceUnits };
